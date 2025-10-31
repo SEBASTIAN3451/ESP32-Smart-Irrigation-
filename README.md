@@ -19,7 +19,9 @@ Sistema inteligente de riego automático para plantas con monitoreo de humedad d
 - 📱 **Dashboard Web Responsive**: Control desde cualquier dispositivo
 - 🔔 **Indicador LED RGB**: Estado visual del sistema
 - 📈 **Estadísticas**: Historial de riegos y tiempo total
-- ⏱️ **Programación Horaria**: Configura horarios automáticos (próximamente)
+- ⏱️ **Programación Horaria**: 3 horarios diarios configurables (nuevo)
+- ⚡ **Tiempo Real (SSE)**: Actualizaciones instantáneas del estado de bomba y humedad
+- 🌐 **mDNS**: Acceso por `http://esp32-irrig.local`
 - 🛡️ **Protección**: Límite de tiempo máximo de riego (seguridad)
 
 ## 🚀 Funcionalidades
@@ -106,8 +108,8 @@ GND      <-->  GND Bomba
 ### 2. Clonar el Repositorio
 
 ```bash
-git clone https://github.com/TU_USUARIO/ESP32_Smart_Irrigation.git
-cd ESP32_Smart_Irrigation
+git clone https://github.com/SEBASTIAN3451/ESP32-Smart-Irrigation-.git
+cd ESP32-Smart-Irrigation-
 ```
 
 ### 3. Configurar WiFi
@@ -191,6 +193,37 @@ Cambiar modo de operación
 ```bash
 curl -X POST http://192.168.1.100/api/mode?mode=auto
 ```
+
+#### `GET /api/schedule`
+Obtiene los 3 horarios configurados
+
+Respuesta:
+```json
+[
+  {"index":0, "hour":7,  "minute":0,  "duration":10, "enabled":true},
+  {"index":1, "hour":14, "minute":0,  "duration":10, "enabled":false},
+  {"index":2, "hour":19, "minute":30, "duration":15, "enabled":true}
+]
+```
+
+#### `POST /api/schedule`
+Configura un horario. Parámetros (x-www-form-urlencoded): `index` (0..2), `hour` (0..23), `minute` (0..59), `duration` (segundos, >=1), `enabled` (true/false)
+
+Ejemplo:
+```bash
+curl -X POST \
+  -d "index=0" -d "hour=7" -d "minute=0" -d "duration=20" -d "enabled=true" \
+  http://192.168.1.100/api/schedule
+```
+
+#### `GET /events`
+Server‑Sent Events con evento "update" cuando cambia el estado.
+
+#### `GET /metrics`
+Métricas en formato Prometheus (`esp32_soil_moisture_percent`, `esp32_pump_active`).
+
+#### `GET /healthz`
+Health check simple.
 
 ## 🎨 Indicador LED RGB
 
@@ -304,13 +337,13 @@ MIT License - Ver [LICENSE](LICENSE) para detalles.
 
 **Sebastian Lara**
 
-- GitHub: [@TU_USUARIO](https://github.com/TU_USUARIO)
+- GitHub: [@SEBASTIAN3451](https://github.com/SEBASTIAN3451)
 - LinkedIn: [Tu Perfil](https://linkedin.com/in/tu-perfil)
 
 ## 🌟 Proyectos Relacionados
 
-- [ESP32 Temperature Monitor](https://github.com/TU_USUARIO/ESP32_Temperature_Monitor)
-- [Smart Agriculture Platform](https://github.com/TU_USUARIO/otro-proyecto)
+- [ESP32 Temperature Monitor](https://github.com/SEBASTIAN3451/ESP32-Temperature-Monitor-)
+- [Smart Agriculture Platform](https://github.com/SEBASTIAN3451/otro-proyecto)
 
 ## 📖 Referencias
 

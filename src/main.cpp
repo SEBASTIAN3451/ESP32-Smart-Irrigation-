@@ -37,6 +37,8 @@
 #include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
 #include <Preferences.h>
+#include <ESPmDNS.h>
+#include <time.h>
 
 // ==================== CONFIGURACIÓN ====================
 
@@ -61,6 +63,7 @@ const char* password = "TU_WIFI_PASSWORD";
 // ==================== OBJETOS GLOBALES ====================
 
 AsyncWebServer server(80);
+AsyncEventSource events("/events");
 Adafruit_NeoPixel led(LED_COUNT, LED_RGB_PIN, NEO_GRB + NEO_KHZ800);
 Preferences preferences;
 
@@ -74,6 +77,7 @@ unsigned long lastCheck = 0;
 unsigned long pumpStartTime = 0;
 unsigned long totalWateringTime = 0;
 int wateringCount = 0;
+time_t lastNtpSync = 0;
 
 // Horarios programados (formato 24h)
 struct Schedule {
@@ -88,6 +92,10 @@ Schedule schedules[3] = {
     {14, 0, 10, false},   // 2:00 PM, 10 segundos
     {19, 0, 10, false}    // 7:00 PM, 10 segundos
 };
+
+// Evitar re-ejecutar el mismo minuto
+int lastRunDay[3] = {-1, -1, -1};
+int lastRunMinute[3] = {-1, -1, -1};
 
 // ==================== PÁGINA WEB ====================
 
@@ -351,29 +359,27 @@ const char index_html[] PROGMEM = R"rawliteral(
     <script>
         let modeButtons = document.querySelectorAll('.mode-btn');
         
-        function updateData() {
-            fetch('/api/status')
-                .then(response => response.json())
-                .then(data => {
-                    document.getElementById('moisture').textContent = data.moisture_percent;
-                    document.getElementById('moistureBar').style.width = data.moisture_percent + '%';
-                    
-                    const pumpStatus = document.getElementById('pumpStatus');
-                    const pumpText = document.getElementById('pumpText');
-                    if (data.pump_active) {
-                        pumpStatus.className = 'pump-status pump-on';
-                        pumpText.textContent = '💧 Bomba Activa';
-                    } else {
-                        pumpStatus.className = 'pump-status pump-off';
-                        pumpText.textContent = 'Bomba Apagada';
-                    }
-                    
-                    document.getElementById('modeText').textContent = data.mode;
-                    document.getElementById('wateringCount').textContent = data.watering_count;
-                    document.getElementById('totalTime').textContent = data.total_time + 's';
-                    document.getElementById('avgMoisture').textContent = data.moisture_percent + '%';
-                })
-                .catch(error => console.error('Error:', error));
+        function apply(data){
+            document.getElementById('moisture').textContent = data.moisture_percent;
+            document.getElementById('moistureBar').style.width = data.moisture_percent + '%';
+            const pumpStatus = document.getElementById('pumpStatus');
+            const pumpText = document.getElementById('pumpText');
+            if (data.pump_active) { pumpStatus.className = 'pump-status pump-on'; pumpText.textContent = '💧 Bomba Activa'; }
+            else { pumpStatus.className = 'pump-status pump-off'; pumpText.textContent = 'Bomba Apagada'; }
+            document.getElementById('modeText').textContent = data.mode;
+            document.getElementById('wateringCount').textContent = data.watering_count;
+            document.getElementById('totalTime').textContent = data.total_time + 's';
+            document.getElementById('avgMoisture').textContent = data.moisture_percent + '%';
+        }
+
+        // SSE
+        try {
+            const es = new EventSource('/events');
+            es.addEventListener('update', ev => { try { apply(JSON.parse(ev.data)); } catch(e){} });
+        } catch(e) {}
+
+        async function updateData(){
+            try { const r = await fetch('/api/status'); apply(await r.json()); } catch(e){}
         }
         
         function setMode(mode) {
@@ -395,7 +401,7 @@ const char index_html[] PROGMEM = R"rawliteral(
                 .then(() => updateData());
         }
         
-        setInterval(updateData, 2000);
+        setInterval(updateData, 4000);
         updateData();
     </script>
 </body>
@@ -433,6 +439,16 @@ void activatePump(bool state) {
         pumpStartTime = 0;
         setLEDColor(0, 255, 0);  // Verde = OK
         Serial.println("⛔ Bomba DESACTIVADA");
+
+        // Notificar SSE
+        StaticJsonDocument<256> doc;
+        doc["moisture_percent"] = soilMoisture;
+        doc["pump_active"] = pumpActive;
+        doc["mode"] = (currentMode == AUTO) ? "Automático" : (currentMode == MANUAL) ? "Manual" : "Programado";
+        doc["watering_count"] = wateringCount;
+        doc["total_time"] = totalWateringTime;
+        String payload; serializeJson(doc, payload);
+        events.send(payload.c_str(), "update", millis());
     }
 }
 
@@ -482,6 +498,17 @@ void setupWiFi() {
         Serial.print("✓ IP: ");
         Serial.println(WiFi.localIP());
         setLEDColor(0, 255, 0);  // Verde = conectado
+
+        // mDNS
+        if (MDNS.begin("esp32-irrig")) {
+            MDNS.addService("http", "tcp", 80);
+            Serial.println("✓ mDNS: http://esp32-irrig.local");
+        }
+
+        // NTP
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        time_t now = time(nullptr);
+        if (now > 100000) lastNtpSync = now;
     } else {
         Serial.println("\n✗ Error de WiFi");
         setLEDColor(255, 0, 0);  // Rojo = error
@@ -532,6 +559,40 @@ void setupWebServer() {
         }
         request->send(200, "text/plain", "OK");
     });
+
+    // Schedule API
+    server.on("/api/schedule", HTTP_GET, [](AsyncWebServerRequest *request){
+        StaticJsonDocument<400> doc;
+        for (int i=0;i<3;i++){
+            JsonObject s = doc.createNestedObject();
+            s["index"]=i; s["hour"]=schedules[i].hour; s["minute"]=schedules[i].minute; s["duration"]=schedules[i].duration; s["enabled"]=schedules[i].enabled;
+        }
+        String out; serializeJson(doc, out);
+        request->send(200, "application/json", out);
+    });
+    server.on("/api/schedule", HTTP_POST, [](AsyncWebServerRequest *request){
+        int idx=-1; if (request->hasParam("index", true)) idx = request->getParam("index", true)->value().toInt();
+        if (idx<0 || idx>2){ request->send(400, "text/plain", "index 0..2"); return; }
+        if (request->hasParam("hour", true)) schedules[idx].hour = constrain(request->getParam("hour", true)->value().toInt(), 0, 23);
+        if (request->hasParam("minute", true)) schedules[idx].minute = constrain(request->getParam("minute", true)->value().toInt(), 0, 59);
+        if (request->hasParam("duration", true)) schedules[idx].duration = max(1, request->getParam("duration", true)->value().toInt());
+        if (request->hasParam("enabled", true)) schedules[idx].enabled = request->getParam("enabled", true)->value() == "true";
+        request->send(200, "text/plain", "OK");
+    });
+
+    // Health & metrics
+    server.on("/healthz", HTTP_GET, [](AsyncWebServerRequest *request){ request->send(200, "text/plain", "ok"); });
+    server.on("/metrics", HTTP_GET, [](AsyncWebServerRequest *request){
+        String m; m += "esp32_soil_moisture_percent "; m += String(soilMoisture); m += "\n";
+        m += "esp32_pump_active "; m += (pumpActive?1:0); m += "\n";
+        request->send(200, "text/plain; version=0.0.4", m);
+    });
+
+    // SSE
+    events.onConnect([](AsyncEventSourceClient *client){
+        StaticJsonDocument<200> doc; doc["moisture_percent"]=soilMoisture; doc["pump_active"]=pumpActive; String p; serializeJson(doc,p); client->send(p.c_str(), "update", millis());
+    });
+    server.addHandler(&events);
     
     server.begin();
     Serial.println("✓ Servidor web iniciado\n");
@@ -558,6 +619,7 @@ void setup() {
         Serial.println("🌐 Dashboard disponible en:");
         Serial.print("   http://");
         Serial.println(WiFi.localIP());
+        Serial.println("   http://esp32-irrig.local (mDNS)");
         Serial.println("\n📊 Iniciando monitoreo...\n");
     }
 }
@@ -580,6 +642,36 @@ void loop() {
             Serial.println("MANUAL");
         } else {
             Serial.println("PROGRAMADO");
+            // Chequear horarios
+            time_t now = time(nullptr);
+            if (now > 100000) {
+                struct tm t; localtime_r(&now, &t);
+                for (int i=0;i<3;i++){
+                    if (!schedules[i].enabled) continue;
+                    if (t.tm_hour==schedules[i].hour && t.tm_min==schedules[i].minute) {
+                        int day = t.tm_yday; int minute = t.tm_hour*60 + t.tm_min;
+                        if (lastRunDay[i]!=day || lastRunMinute[i]!=minute) {
+                            Serial.printf("⏰ Ejecutando horario %d (%02d:%02d) por %d s\n", i, schedules[i].hour, schedules[i].minute, schedules[i].duration);
+                            activatePump(true);
+                            // Programar apagado por duración
+                            pumpStartTime = millis();
+                            // Forzar detención cuando pase duración
+                            // La lógica de seguridad en autoIrrigation también cubre este caso
+                            lastRunDay[i]=day; lastRunMinute[i]=minute;
+                        }
+                    }
+                }
+                // Cortar cuando alcance duración en modo programado
+                if (pumpActive && pumpStartTime>0) {
+                    unsigned long elapsed = (millis()-pumpStartTime)/1000;
+                    for (int i=0;i<3;i++){
+                        if (schedules[i].enabled && elapsed >= (unsigned long)schedules[i].duration) {
+                            activatePump(false);
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
     
